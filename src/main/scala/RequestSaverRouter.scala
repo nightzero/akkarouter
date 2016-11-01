@@ -1,10 +1,12 @@
 import java.time.{Duration, Instant}
 import java.util.concurrent.Executors
 
+import GateKeeperMessages.{Granted, Halt, Permission2Enter}
 import akka.actor.{Actor, ActorRef, ActorSystem, Props}
 import akka.routing.BalancingPool
+import akka.util.Timeout
 
-import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
 
@@ -26,25 +28,37 @@ class RequestSaverRouterImpl(as: ActorSystem) extends RequestSaver {
   private val executorService = Executors.newCachedThreadPool()
 
   private val requestPersister:ActorRef = as.actorOf(RequestPersister.props()(ExecutionContext.fromExecutorService(executorService)), "RequestPersister")
-  private val requestSaverRouter: ActorRef = as.actorOf(BalancingPool(1000).props(RequestSaverWorker.props(requestPersister)), "RequestSaverRouter")
+  private val gateKeeper: ActorRef = as.actorOf(GateKeeper.props)
+  private val throttler: ActorRef = as.actorOf(Throttler.props(gateKeeper, requestPersister))
+  private val requestSaverRouter: ActorRef = as.actorOf(BalancingPool(1000).props(RequestSaverWorker.props(throttler)), "RequestSaverRouter")
+
 
   def save(msg: String): Future[Duration] = {
+    import akka.pattern.ask
+    import scala.concurrent.duration.DurationInt
+
+    implicit val timeout = Timeout(5.seconds)
+    val future = gateKeeper ? Permission2Enter
+    val enterResult = Await.result(future, timeout.duration)
+
     val promise = Promise[Duration]()
-    if (GateKeeper.gateOpen()) {
-      requestSaverRouter ! new Request(msg, promise, Instant.now())
+    enterResult match {
+      case Halt => promise.failure(new Exception("Queue full")).future
+      case Granted =>
+        requestSaverRouter ! new Request(msg, promise, Instant.now())
+        promise.future
     }
-    promise.future
   }
 }
 
 object RequestSaverWorker {
-  def props(requestPersister:ActorRef) = Props(new RequestSaverWorker(requestPersister))
+  def props(throttler:ActorRef) = Props(new RequestSaverWorker(throttler))
 }
 
-class RequestSaverWorker(requestPersister:ActorRef) extends Actor {
+class RequestSaverWorker(throttler:ActorRef) extends Actor {
   import RequestSaverMessages._
   def receive = {
-    case req: Request => requestPersister ! req
+    case req: Request => throttler ! req
     case resp: Response => resp.promise.success(Duration.between(resp.startTime, Instant.now()))
   }
 }
@@ -89,22 +103,3 @@ object RequestSaverMessages {
   case class Request(msg: String, promise: Promise[Duration], startTime:Instant)
   case class Response(msg: String, promise: Promise[Duration], startTime:Instant)
 }
-
-object GateKeeper {
-  def gateOpen(): Boolean = true
-}
-
-
-/*
-trait GateKeeperMessages {
-  case object Permission2Enter
-  case object Permission2EnterGranted
-}
-object GateKeeper {
-  def props() = Props()
-}
-class GateKeeper extends Actor with GateKeeperMessages{
-  def receive = {
-    case Permission2Enter => sender ! Permission2EnterGranted
-  }
-}*/
